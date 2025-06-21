@@ -1,0 +1,8 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+## Behaviour
+- If you are not explicitly prompted don't explain the changes you made. Provide only the updated code.
+- Write code without comments.

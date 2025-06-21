@@ -1,0 +1,181 @@
+
+Requirements.txt
+================
+
+1  Product Scope & User Stories
+--------------------------------
+Epic                | Story (BDD style)                                                                                  | KPI / Acceptance Criteria
+------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------
+Note‑Taking Canvas  | As a learner, I can write free‑form ink strokes that are stored locally within ≤10 ms per stroke    | Latency ≤ 10 ms; lost‑stroke rate 0 %
+Live OCR            | Given I write 10 words, when 250 ms pass, then the text layer updates without jank                  | WER ≤ 4 % on IAM‑online; update patch area ≤ 25 % of viewport
+AI Prompt Palette   | As a user, I can select strokes and tap “Explain” or “Summarise” to get an answer in the same hand‑writing | Round‑trip ≤ 700 ms on 5G; style‑similarity cosine ≥ 0.92
+Collaboration       | Two users editing the same page see changes within 300 ms                                           | OT convergence, CRDT conflict‑free
+Export / Share      | I can export the page as PDF or Markdown+PNG with preserved math                                    | Fidelity score ≥ 95 % (InkML → LaTeX)
+Monetisation        | Upgrade to Pro unlocks math recognition & extra AI tokens                                          | Stripe receipt events handled idempotently
+
+
+2  Architecture Overview
+------------------------
+```mermaid
+flowchart TD
+  subgraph Mobile/Web Client (React 19)
+    Canvas[InkCanvas] --> LiveStore[Zustand\|Synced CRDT]
+    LiveStore --> WebSocket
+    AIpalette --> WebSocket
+  end
+
+  subgraph Edge Runtime
+    WebSocket --> Gateway[FastAPI + Uvicorn  
+ HTTP/2 + gRPC]
+  end
+
+  Gateway -->|/llm/invoke| GeminiSvc(Gemini Proxy)
+  Gateway -->|/ink/recognize| InkFMSvc(InkFM serv.)
+  Gateway -->|/ink/synthesize| WriteViTSvc(WriteViT serv.)
+  Gateway -->|/auth| AuthSvc(Keycloak OIDC)
+  Gateway -->|/data| Postgres[(PostgreSQL 16 + PostGIS)]
+  Gateway -->|/blobs| MinIO[S3-compatible]
+  Gateway -->|pub/sub| Redis
+```
+All inter‑service traffic uses mutual‑TLS over the cluster network.
+
+
+3  Detailed Functional Requirements
+-----------------------------------
+
+### 3.1 Ink Capture
+1. Capture **(x,y,t,pressure,tilt)** for every pointer event.  
+2. Compress to Protobuf + Brotli ≤ 1 kB / 100 strokes.  
+3. Persist to local IndexedDB; optimistic sync when online.
+
+### 3.2 Handwriting Recognition
+
+Stage        | Tech                        | Notes
+------------ | --------------------------- | -----------------------------------------
+Pre‑proc     | NumPy/Numba in WASM         | Smoothing, tilt‑compensation
+Model        | InkFM fine‑tuned checkpoint | Runs on GPU pod (A10) or local ML Kit fallback
+Post‑proc    | KenLM 4‑gram + BPE spell‑fix| Improves WER by ≈ 6 pp
+
+### 3.3 LLM Workflows
+* `/summarise`, `/explain`, `/translate`, `/generate‑quiz`
+* Gemini 1.5 Pro streamed via google‑genai Python SDK.
+* Token‑budgeting middleware enforces user quota; strips PII in debug logs.
+
+### 3.4 Handwriting Synthesis
+
+Component       | Implementation
+--------------- | --------------
+Style encoder   | Writer‑ID block from WriteViT
+Generator       | WriteViT decoder → stroke array
+Rasteriser      | SkiaPath (Android/Web) / QuartzPath (iOS)
+
+### 3.5 Collaboration & Sync
+* Automerge 2 CRDT; binary patch streamed over WebSocket.  
+* Snapshot every 2 MB or 5 min, whichever first.  
+* Conflict policy: *last‑writer‑wins on strokes*, *JSON merge on metadata*.
+
+
+4  Tech‑Stack Decision Matrix
+-----------------------------
+
+Layer        | Primary Choice                           | Why                                         | Runner
+-----------  | ---------------------------------------- | ------------------------------------------- | -------------
+Frontend     | **React 19** with Vite + TypeScript      | Server Components, `use()` async hook       | Browser / Capacitor
+Mobile Shell | **Capacitor 6**                          | Zero JS bridges, SwiftPM, AppStore‑safe     | iOS / Android
+Canvas       | `perfect‑freehand`, WebGPU path renderer | 120 Hz ink refresh                           |
+State        | Zustand + Automerge                      | Minimal boiler‑plate                        |
+Backend      | Python 3.12 + FastAPI                    | async, type‑safe, OpenAPI                   |
+Auth         | Keycloak 24 (OIDC)                       | Multi‑tenant, social login                  |
+Data         | PostgreSQL 16 + PostGIS                  | Spatial queries for ink bounds              |
+Blobs        | MinIO S3                                 | Cheaper than AWS S3                         |
+Cache/PubSub | Redis 7 streams                          | Stroke diff fan‑out                         |
+CI/CD        | GitHub Actions → Docker → Argo CD        | Zero‑downtime roll‑outs                     |
+Observability| OpenTelemetry → Grafana Cloud            | Traces + logs + metrics                     |
+
+
+5  API Design (high‑level)
+--------------------------
+
+Endpoint            | Verb | Auth | Payload
+------------------- | ---- | ---- | ----------------------------------------------------------
+`/v1/ink/strokes`   | PUT  | user | Batch of 500 strokes
+`/v1/ink/recognize` | POST | user | `{lang, stroke_ids[]}`
+`/v1/ai/run`        | POST | user | `{action, stroke_ids[], params}`
+`/v1/ink/synthesize`| POST | user | `{text, style_id}`
+`/v1/export/pdf`    | GET  | user | `page_id`
+
+gRPC mirrors exist for the recognize & synthesize endpoints to avoid JSON overhead.
+
+
+6  Performance & SLA Targets
+----------------------------
+
+Metric                     | Target
+-------------------------- | -------------
+Cold start (Capacitor)     | ≤ 1.0 s TTI
+Stroke RTT (WebSocket)     | ≤ 40 ms
+Live OCR latency           | ≤ 150 ms / 10 words
+AI round‑trip              | ≤ 700 ms / 200 tokens
+Server 99th percentile     | ≤ 250 ms / HTTP
+Service availability       | 99.5 % monthly
+
+
+7  Security & Compliance
+------------------------
+
+* **E2EE**: ChaCha20‑Poly1305 on stroke blobs; keys in device secure enclave.  
+* **OWASP ASVS L2** baseline; quarterly pen‑test.  
+* **GDPR / CCPA**: data portability (ZIP‑of‑Markdown+PNG), right‑to‑erase.  
+* **App Store guard**: refuse to load if WebView detects remote code > 72 h old to satisfy Apple’s “minimum native functionality” rule.
+
+
+8  Build / Test Workflow
+------------------------
+
+```bash
+# local dev
+make dev      # spins up Postgres, MinIO, Redis
+make test     # pytest + playwright e2e
+
+# CI (.github/workflows/main.yaml)
+- lint (ruff, mypy)
+- test (pytest -n auto)
+- build docker
+- deploy to staging (Argo)
+- run k6 perf smoke
+- promote to prod (manual)
+```
+
+
+9  Milestones (6‑month MVP Track)
+---------------------------------
+
+Sprint | Deliverable
+------ | ---------------------------------------------
+1      | Capacitor shell + React 19 canvas prototype
+2      | Local stroke persistence & replay
+3      | FastAPI gateway, WebSocket channel
+4      | InkFM micro‑service, live OCR
+5      | Gemini proxy + prompt palette (typed output)
+6      | WriteViT synthesis, render AI ink
+7      | Stripe integration, Pro paywall
+8      | Beta in TestFlight / Play Console
+9      | Hardening, telemetry, accessibility audit
+10     | **MVP launch**
+
+
+10  Risks & Mitigations
+-----------------------
+
+Risk                             | Impact             | Mitigation
+-------------------------------- | ------------------ | --------------------------------------------
+App Store rejection (web‑app)    | Launch delay       | Capacitor native plugins: Push, Files, IAP
+Large stylus data drains battery | User churn         | Throttled sampling on low battery
+OCR accuracy on cursive Bulgarian| Poor UX            | Active‑learn fine‑tune every sprint
+
+
+11  Next Actions
+----------------
+1. Scaffold the mono‑repo (`nx` or `turbo`) with shared ESLint + Ruff rules.  
+2. Record ~200 hand‑written sentences to seed InkFM fine‑tune job.  
+3. Wire up `/ai/run` endpoint stub and stream Gemini tokens.
